@@ -6,6 +6,7 @@ Usage:
     port_agent.py rsn <port> <commandport> <instaddr> <instport> <digiport> [--sniff=<sniffport>] [--name=<name>]
     port_agent.py botpt <port> <commandport> <instaddr> <rxport> <txport> [--sniff=<sniffport>] [--name=<name>]
     port_agent.py camhd <port> <commandport> <instaddr> <subport> <reqport> [--sniff=<sniffport>] [--name=<name>]
+    port_agent.py antelope <port> <commandport> <instaddr> <instport> [--sniff=<sniffport>] [--name=<name>]
     port_agent.py datalog <port> <commandport> <files>...
 
 Options:
@@ -15,10 +16,15 @@ Options:
 
 """
 from __future__ import division
-from collections import Counter
+
 import json
 import logging
 import struct
+import threading
+import yaml
+import time
+
+from collections import Counter
 from datetime import datetime
 from twisted.internet.endpoints import TCP4ServerEndpoint
 from twisted.internet import reactor
@@ -26,8 +32,19 @@ from twisted.internet.protocol import Protocol, connectionDone, ReconnectingClie
 from twisted.protocols.basic import LineOnlyReceiver
 from twisted.python import log
 from twisted.python.logfile import DailyLogFile
-from txzmq import ZmqFactory, ZmqSubConnection, ZmqEndpoint, ZmqREQConnection
-import yaml
+
+try:
+    from txzmq import ZmqFactory, ZmqSubConnection, ZmqEndpoint, ZmqREQConnection
+except ImportError:
+    pass
+
+# antelope may not always be available (non-antelope machines)
+try:
+    from antelope import Pkt
+    from antelope.orb import orbopen, OrbIncompleteException
+except ImportError:
+    pass
+
 
 
 # Port agent attempts to reconnect to instrument with exponential backoff
@@ -53,23 +70,32 @@ NEWLINE = '\n'
 
 class Enumeration(object):
     ALL = 'ALL'
+    _keys = None
+    _values = None
+    _dict = None
 
     @classmethod
     def values(cls):
         """Return the values of this enum."""
-        return (getattr(cls, attr) for attr in cls.keys())
+        if cls._values is None:
+            cls._values = (getattr(cls, attr) for attr in cls.keys())
+        return cls._values
 
     @classmethod
     def dict(cls):
         """Return a dict representation of this enum."""
-        return {attr: getattr(cls, attr) for attr in cls.keys()}
+        if cls._dict is None:
+            cls._dict = {attr: getattr(cls, attr) for attr in cls.keys()}
+        return cls._dict
 
     @classmethod
     def keys(cls):
         """Return the keys of this enum"""
-        return [attr for attr in dir(cls) if all((not callable(getattr(cls, attr)),
-                                                  not attr.startswith('__'),
-                                                  not attr == 'ALL'))]
+        if cls._keys is None:
+            cls._keys = [attr for attr in dir(cls) if all((not callable(getattr(cls, attr)),
+                                                            not attr.startswith('_'),
+                                                            not attr == 'ALL'))]
+        return cls._keys
 
     @classmethod
     def has(cls, item):
@@ -90,6 +116,7 @@ class AgentTypes(Enumeration):
     RSN = 'rsn'
     BOTPT = 'botpt'
     CAMHD = 'camhd'
+    ANTELOPE = 'antelope'
     DATALOG = 'datalog'
 
 
@@ -744,6 +771,50 @@ class CamhdPortAgent(PortAgent):
                                                 self.factory,
                                                 self.command_endpoint)
 
+
+class AntelopePortAgent(PortAgent):
+    def __init__(self, config):
+        super(AntelopePortAgent, self).__init__(config)
+        self.inst_addr = config['instaddr']
+        self.inst_port = config['instport']
+        self.keep_going = True
+        self._start_inst_connection()
+
+    def _register_loggers(self):
+        """
+        Overridden, no logging on antelope, antelope keeps track of its own data...
+        """
+        pass
+
+    def disconnect(self):
+        self.keep_going = False
+
+    def _start_inst_connection(self):
+        reactor.addSystemEventTrigger('before', 'shutdown', self.disconnect)
+
+        class OrbThread(threading.Thread):
+            def __init__(self, addr, port, port_agent):
+                super(OrbThread, self).__init__()
+                self.addr = addr
+                self.port = port
+                self.port_agent = port_agent
+
+            def run(self):
+                with orbopen('%s:%d' % (self.addr, self.port)) as orb:
+                    while self.port_agent.keep_going:
+                        try:
+                            pktid, srcname, pkttime, data = orb.reap(5)
+                            orb_packet = Pkt.Packet(srcname, pkttime, data)
+                            orb_packet = orbpkt2dict(orb_packet)
+                            packet = Packet(json.dumps(orb_packet), PacketType.FROM_INSTRUMENT)
+                            reactor.callFromThread(self.port_agent.router.got_data, packet)
+                        except OrbIncompleteException:
+                            pass
+
+        thread = OrbThread(self.inst_addr, self.inst_port, self)
+        thread.start()
+
+
 class DatalogReadingPortAgent(PortAgent):
     def __init__(self, config):
         super(DatalogReadingPortAgent, self).__init__(config)
@@ -796,6 +867,60 @@ class DatalogReadingPortAgent(PortAgent):
 #################################################################################
 # Support methods
 #################################################################################
+
+def orbpkt2dict(orbpkt):
+    d = dict()
+    channels = []
+    d['channels'] = channels
+    for orbchan in orbpkt.channels:
+        channel = dict()
+        channels.append(channel)
+        channel['calib'] = orbchan.calib
+        channel['calper'] = orbchan.calper
+        channel['chan'] = orbchan.chan
+        channel['cuser1'] = orbchan.cuser1
+        channel['cuser2'] = orbchan.cuser2
+        channel['data'] = orbchan.data
+        channel['duser1'] = orbchan.duser1
+        channel['duser2'] = orbchan.duser2
+        channel['iuser1'] = orbchan.iuser1
+        channel['iuser2'] = orbchan.iuser2
+        channel['iuser3'] = orbchan.iuser3
+        channel['loc'] = orbchan.loc
+        channel['net'] = orbchan.net
+        channel['nsamp'] = orbchan.nsamp
+        channel['samprate'] = orbchan.samprate
+        channel['segtype'] = orbchan.segtype
+        channel['sta'] = orbchan.sta
+        channel['time'] = orbchan.time
+    d['db'] = orbpkt.db
+    d['dfile'] = orbpkt.dfile
+    d['pf'] = orbpkt.pf.pf2dict()
+    srcname = orbpkt.srcname
+    d['srcname'] = dict(
+                        net=srcname.net,
+                        sta=srcname.sta,
+                        chan=srcname.chan,
+                        loc=srcname.loc,
+                        suffix=srcname.suffix,
+                        subcode=srcname.subcode,
+                        joined=srcname.join()
+                       )
+    d['string'] = orbpkt.string
+    d['time'] = orbpkt.time
+    pkttype = orbpkt.type
+    d['type'] = dict(
+                        content=pkttype.content,
+                        name=pkttype.name,
+                        suffix=pkttype.suffix,
+                        hdrcode=pkttype.hdrcode,
+                        bodycode=pkttype.bodycode,
+                        desc=pkttype.desc,
+                    ),
+    d['version'] = orbpkt.version
+
+    return d
+
 
 def configure_logging():
     log_format = '%(asctime)-15s %(levelname)s %(message)s'
@@ -854,6 +979,7 @@ def main():
         AgentTypes.RSN: RsnPortAgent,
         AgentTypes.BOTPT: BotptPortAgent,
         AgentTypes.CAMHD: CamhdPortAgent,
+        AgentTypes.ANTELOPE: AntelopePortAgent,
         AgentTypes.DATALOG: DatalogReadingPortAgent,
     }
 
