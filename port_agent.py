@@ -5,6 +5,8 @@ Usage:
     port_agent.py tcp <port> <commandport> <instaddr> <instport> [--sniff=<sniffport>] [--name=<name>]
     port_agent.py rsn <port> <commandport> <instaddr> <instport> <digiport> [--sniff=<sniffport>] [--name=<name>]
     port_agent.py botpt <port> <commandport> <instaddr> <rxport> <txport> [--sniff=<sniffport>] [--name=<name>]
+    port_agent.py camhd <port> <commandport> <instaddr> <subport> <reqport> [--sniff=<sniffport>] [--name=<name>]
+    port_agent.py datalog <port> <commandport> <files>...
 
 Options:
     -h, --help          Show this screen.
@@ -24,6 +26,7 @@ from twisted.internet.protocol import Protocol, connectionDone, ReconnectingClie
 from twisted.protocols.basic import LineOnlyReceiver
 from twisted.python import log
 from twisted.python.logfile import DailyLogFile
+from txzmq import ZmqFactory, ZmqSubConnection, ZmqEndpoint, ZmqREQConnection
 import yaml
 
 
@@ -37,22 +40,36 @@ ROUTER_STATS_INTERVAL = 10
 # Command to set the DIGI timestamps to binary mode, sent automatically upon every DIGI connection
 BINARY_TIMESTAMP = 'time 2\n'
 
+# Interval between heartbeat packets
+HEARTBEAT_INTERVAL = 10
+
+# NEWLINE
+NEWLINE = '\n'
+
+
+#################################################################################
+# Enumerations
+#################################################################################
 
 class Enumeration(object):
+    ALL = 'ALL'
+
     @classmethod
     def values(cls):
         """Return the values of this enum."""
-        return (getattr(cls,attr) for attr in cls.keys())
+        return (getattr(cls, attr) for attr in cls.keys())
 
     @classmethod
     def dict(cls):
         """Return a dict representation of this enum."""
-        return {attr: getattr(cls,attr) for attr in cls.keys()}
+        return {attr: getattr(cls, attr) for attr in cls.keys()}
 
     @classmethod
     def keys(cls):
         """Return the keys of this enum"""
-        return [attr for attr in dir(cls) if all((not callable(getattr(cls,attr)), not attr.startswith('__')))]
+        return [attr for attr in dir(cls) if all((not callable(getattr(cls, attr)),
+                                                  not attr.startswith('__'),
+                                                  not attr == 'ALL'))]
 
     @classmethod
     def has(cls, item):
@@ -67,15 +84,13 @@ class Enumeration(object):
                 return key
         return default
 
-    @classmethod
-    @property
-    def ALL(cls):
-        return 'ALL'
 
-    @classmethod
-    @property
-    def NONE(cls):
-        return None
+class AgentTypes(Enumeration):
+    TCP = 'tcp'
+    RSN = 'rsn'
+    BOTPT = 'botpt'
+    CAMHD = 'camhd'
+    DATALOG = 'datalog'
 
 
 class Format(Enumeration):
@@ -88,7 +103,6 @@ class Format(Enumeration):
 class EndpointType(Enumeration):
     INSTRUMENT = 'instrument'  # TCP/RSN
     INSTRUMENT_DATA = 'instrument_data'  # BOTPT
-    INSTRUMENT_CMD = 'instrument_cmd'  # BOTPT
     DIGI = 'digi_cmd'  # RSN
     CLIENT = 'client'
     COMMAND = 'command'
@@ -118,6 +132,10 @@ class RouterStat(Enumeration):
     PACKET_IN = 3
     PACKET_OUT = 4
 
+
+#################################################################################
+# Port Agent Packet
+#################################################################################
 
 class Packet(object):
     """
@@ -154,6 +172,30 @@ class Packet(object):
 
         self._logstring = None
 
+    @staticmethod
+    def packet_from_fh(file_handle):
+        data_buffer = bytearray()
+        while True:
+            byte = file_handle.read(1)
+            if byte == '':
+                return None
+
+            data_buffer.append(byte)
+            sync_index = data_buffer.find(Packet.sync)
+            if sync_index != -1:
+                # found the sync bytes, read the rest of the header
+                data_buffer.extend(file_handle.read(Packet.header_size - len(Packet.sync)))
+
+                if len(data_buffer) == Packet.header_size:
+                    _, packet_type, packet_size, checksum, ts_high, ts_low = struct.unpack_from(Packet.header_format,
+                                                                                                data_buffer, sync_index)
+                    # read the payload
+                    payload = file_handle.read(packet_size-Packet.header_size)
+                    packet = Packet(payload, packet_type, header=str(data_buffer[sync_index:]))
+                    return packet
+                else:
+                    print repr(data_buffer), len(data_buffer)
+
     @property
     def time(self):
         if not self._time:
@@ -176,7 +218,8 @@ class Packet(object):
                             temp_header[self.checksum_index+self.checksum_size:])
         return self._header
 
-    def _checksum(self, header, payload):
+    @staticmethod
+    def _checksum(header, payload):
         data = bytearray(header + payload)
         lrc = 0
         for byte in data:
@@ -207,6 +250,10 @@ class Packet(object):
     def __repr__(self):
         return self.data
 
+
+#################################################################################
+# Port Agent Router
+#################################################################################
 
 class Router(object):
     """
@@ -268,8 +315,6 @@ class Router(object):
 
             for client in self.clients[endpoint_type]:
                 self.statistics[RouterStat.PACKET_OUT] += 1
-                log.msg('%s -> %s (%s)(%s) %r' % (packet.packet_type, endpoint_type, client, data_format, packet.payload),
-                        logLevel=logging.DEBUG)
                 client.write(msg)
 
     def register(self, endpoint_type, source):
@@ -306,6 +351,10 @@ class Router(object):
         self.statistics.clear()
         reactor.callLater(ROUTER_STATS_INTERVAL, self.log_stats)
 
+
+#################################################################################
+# Protocols
+#################################################################################
 
 class PortAgentProtocol(Protocol):
     """
@@ -360,58 +409,12 @@ class DigiProtocol(InstrumentProtocol):
         self.transport.write(BINARY_TIMESTAMP)
 
 
-class InstrumentClientFactory(ReconnectingClientFactory):
-    """
-    Factory for instrument connections. Uses automatic reconnection with exponential backoff.
-    """
-    protocol = InstrumentProtocol
-    maxDelay = MAX_RECONNECT_DELAY
-
-    def __init__(self, port_agent, packet_type, endpoint_type):
-        self.port_agent = port_agent
-        self.packet_type = packet_type
-        self.endpoint_type = endpoint_type
-        self.connection = None
-
-    def buildProtocol(self, addr):
-        log.msg('Made TCP connection to instrument (%s), building protocol' % addr)
-        p = self.protocol(self.port_agent, self.packet_type, self.endpoint_type)
-        p.factory = self
-        self.connection = p
-        self.resetDelay()
-        return p
-
-
-class DigiClientFactory(InstrumentClientFactory):
-    """
-    Overridden to use DigiProtocol to automatically set binary timestamp on connection
-    """
-    protocol = DigiProtocol
-
-
-class DataFactory(Factory):
-    """
-    This is the base class for incoming connections (data, command, sniffer)
-    """
-    protocol = PortAgentProtocol
-    def __init__(self, port_agent, packet_type, endpoint_type):
-        self.port_agent = port_agent
-        self.packet_type = packet_type
-        self.endpoint_type = endpoint_type
-
-    def buildProtocol(self, addr):
-        log.msg('Established incoming connection (%s)' % addr)
-        p = self.protocol(self.port_agent, self.packet_type, self.endpoint_type)
-        p.factory = self
-        return p
-
-
 class CommandProtocol(LineOnlyReceiver):
     """
     Specialized protocol which is not called until a line of text terminated by the delimiter received
     default delimiter is '\r\n'
     """
-    digi_commands = ['help', 'tinfo', 'cinfo', 'time', 'timestamp', 'power', 'break']
+    digi_commands = ['help', 'tinfo', 'cinfo', 'time', 'timestamp', 'power', 'break', 'gettime', 'getver']
 
     def __init__(self, port_agent, packet_type, endpoint_type):
         self.port_agent = port_agent
@@ -462,6 +465,56 @@ class CommandProtocol(LineOnlyReceiver):
         self.transport.write(data)
 
 
+#################################################################################
+# Factories
+#################################################################################
+
+class InstrumentClientFactory(ReconnectingClientFactory):
+    """
+    Factory for instrument connections. Uses automatic reconnection with exponential backoff.
+    """
+    protocol = InstrumentProtocol
+    maxDelay = MAX_RECONNECT_DELAY
+
+    def __init__(self, port_agent, packet_type, endpoint_type):
+        self.port_agent = port_agent
+        self.packet_type = packet_type
+        self.endpoint_type = endpoint_type
+        self.connection = None
+
+    def buildProtocol(self, addr):
+        log.msg('Made TCP connection to instrument (%s), building protocol' % addr)
+        p = self.protocol(self.port_agent, self.packet_type, self.endpoint_type)
+        p.factory = self
+        self.connection = p
+        self.resetDelay()
+        return p
+
+
+class DigiClientFactory(InstrumentClientFactory):
+    """
+    Overridden to use DigiProtocol to automatically set binary timestamp on connection
+    """
+    protocol = DigiProtocol
+
+
+class DataFactory(Factory):
+    """
+    This is the base class for incoming connections (data, command, sniffer)
+    """
+    protocol = PortAgentProtocol
+
+    def __init__(self, port_agent, packet_type, endpoint_type):
+        self.port_agent = port_agent
+        self.packet_type = packet_type
+        self.endpoint_type = endpoint_type
+
+    def buildProtocol(self, addr):
+        log.msg('Established incoming connection (%s)' % addr)
+        p = self.protocol(self.port_agent, self.packet_type, self.endpoint_type)
+        p.factory = self
+        return p
+
 class CommandFactory(DataFactory):
     """
     Subclasses DataFactory to utilize the CommandProtocol for incoming command connections
@@ -475,6 +528,60 @@ class CommandFactory(DataFactory):
         return p
 
 
+#################################################################################
+# Connections (these are like protocols, but for ZMQ)
+#################################################################################
+
+class CamhdSubscriberConnection(ZmqSubConnection):
+    def __init__(self, port_agent, packet_type, endpoint_type, factory, endpoint=None, identity=None):
+        super(CamhdSubscriberConnection, self).__init__(factory, endpoint, identity)
+        self.port_agent = port_agent
+        self.packet_type = packet_type
+        self.endpoint_type = endpoint_type
+        self.port_agent.router.register(endpoint_type, self)
+        self.subscribe('')
+
+    def gotMessage(self, message, tag):
+        self.port_agent.router.got_data(Packet(tag, self.packet_type))
+        self.port_agent.router.got_data(Packet(message + NEWLINE, self.packet_type))
+
+
+class CamhdCommandConnection(ZmqREQConnection):
+    def __init__(self, port_agent, packet_type, endpoint_type, factory, endpoint=None, identity=None):
+        super(CamhdCommandConnection, self).__init__(factory, endpoint, identity)
+        self.port_agent = port_agent
+        self.packet_type = packet_type
+        self.endpoint_type = endpoint_type
+        self.buf = bytearray()
+        self.port_agent.router.register(endpoint_type, self)
+
+    def write(self, data):
+        self.buf.extend(data)
+        if NEWLINE in self.buf:
+            try:
+                message = json.loads(str(self.buf[:self.buf.index(NEWLINE)]))
+                message = [str(_) for _ in message]
+                log.msg('Send command: ', message)
+                self.sendMsg(*message)
+            except ValueError:
+                log.err()
+            finally:
+                self.buf = bytearray()
+
+    def messageReceived(self, message):
+        pass
+        # TODO: confirm with instrument developer that all messages are duplicated on SUB port
+        # if type(message) == list:
+        #     for part in message:
+        #         self.port_agent.router.got_data(Packet(part, self.packet_type))
+        # else:
+        #     self.port_agent.router.got_data(Packet(message, self.packet_type))
+
+
+#################################################################################
+# Port Agents
+#################################################################################
+
 class PortAgent(object):
     def __init__(self, config):
         self.config = config
@@ -485,15 +592,19 @@ class PortAgent(object):
 
         self.router = Router()
         self.connections = set()
-        self.data_logger = DailyLogFile('%s.datalog' % self.name, '.')
-        self.ascii_logger = DailyLogFile('%s.log' % self.name, '.')
-        self.router.register(EndpointType.DATALOGGER, self.data_logger)
-        self.router.register(EndpointType.LOGGER, self.ascii_logger)
+
+        self._register_loggers()
         self._create_routes()
         self._start_servers()
         self._heartbeat()
         self.num_connections = 0
         log.msg('Base PortAgent initialization complete')
+
+    def _register_loggers(self):
+        self.data_logger = DailyLogFile('%s.datalog' % self.name, '.')
+        self.ascii_logger = DailyLogFile('%s.log' % self.name, '.')
+        self.router.register(EndpointType.DATALOGGER, self.data_logger)
+        self.router.register(EndpointType.LOGGER, self.ascii_logger)
 
     def _create_routes(self):
         # Register the logger and datalogger to receive all messages
@@ -502,7 +613,6 @@ class PortAgent(object):
 
         # from DRIVER
         self.router.add_route(PacketType.FROM_DRIVER, EndpointType.INSTRUMENT, data_format=Format.RAW)
-        self.router.add_route(PacketType.FROM_DRIVER, EndpointType.INSTRUMENT_CMD, data_format=Format.RAW)
 
         # from INSTRUMENT
         self.router.add_route(PacketType.FROM_INSTRUMENT, EndpointType.CLIENT, data_format=Format.PACKET)
@@ -542,7 +652,7 @@ class PortAgent(object):
     def _heartbeat(self):
         packet = Packet('HB', PacketType.PA_HEARTBEAT)
         self.router.got_data(packet)
-        reactor.callLater(1.0, self._heartbeat)
+        reactor.callLater(HEARTBEAT_INTERVAL, self._heartbeat)
 
     def instrument_connected(self, connection):
         self.connections.add(connection)
@@ -562,7 +672,6 @@ class TcpPortAgent(PortAgent):
     Data from the instrument connection is routed to all connected clients.
     Data from the client(s) is routed to the instrument connection
     """
-    # TODO: should we limit the clients able to write to 1?
     def __init__(self, config):
         super(TcpPortAgent, self).__init__(config)
         self.inst_addr = config['instaddr']
@@ -594,11 +703,11 @@ class BotptPortAgent(PortAgent):
     Data from the instrument RX connection is routed to all connected clients.
     Data from the client(s) is routed to the instrument TX connection
     """
-    def __init__(self, options):
-        super(BotptPortAgent, self).__init__(options)
-        self.inst_rx_port = options['<rxport>']
-        self.inst_tx_port = options['<txport>']
-        self.inst_addr = options['<instaddr>']
+    def __init__(self, config):
+        super(BotptPortAgent, self).__init__(config)
+        self.inst_rx_port = config['rxport']
+        self.inst_tx_port = config['txport']
+        self.inst_addr = config['instaddr']
         self._start_inst_connection()
         self.num_connections = 2
         log.msg('BotptPortAgent initialization complete')
@@ -610,9 +719,87 @@ class BotptPortAgent(PortAgent):
         reactor.connectTCP(self.inst_addr, self.inst_tx_port, tx_factory)
 
 
+class CamhdPortAgent(PortAgent):
+    def __init__(self, config):
+        super(CamhdPortAgent, self).__init__(config)
+        self.req_port = config['reqport']
+        self.sub_port = config['subport']
+        self.inst_addr = config['instaddr']
+        self._start_inst_connection()
+        self.num_connections = 2
+        log.msg('CamhdPortAgent initialization complete')
+
+    def _start_inst_connection(self):
+        self.factory = ZmqFactory()
+        self.subscriber_endpoint = ZmqEndpoint('connect', 'tcp://%s:%d' % (self.inst_addr, self.sub_port))
+        self.subscriber = CamhdSubscriberConnection(self,
+                                                    PacketType.FROM_INSTRUMENT,
+                                                    EndpointType.INSTRUMENT_DATA,
+                                                    self.factory,
+                                                    self.subscriber_endpoint)
+        self.command_endpoint = ZmqEndpoint('connect', 'tcp://%s:%d' % (self.inst_addr, self.req_port))
+        self.commander = CamhdCommandConnection(self,
+                                                PacketType.FROM_INSTRUMENT,
+                                                EndpointType.INSTRUMENT,
+                                                self.factory,
+                                                self.command_endpoint)
+
+class DatalogReadingPortAgent(PortAgent):
+    def __init__(self, config):
+        super(DatalogReadingPortAgent, self).__init__(config)
+        self.files = config['files']
+        self._filehandle = None
+        self.target_types = [PacketType.FROM_INSTRUMENT, PacketType.PA_CONFIG]
+        self._start_when_ready()
+
+    def _register_loggers(self):
+        """
+        Overridden, no logging when reading a datalog...
+        """
+        pass
+
+    def _start_when_ready(self):
+        log.msg('waiting for a client connection', self.router.clients[EndpointType.INSTRUMENT_DATA])
+        if len(self.router.clients[EndpointType.CLIENT]) > 0:
+            self._read()
+        else:
+            reactor.callLater(1.0, self._start_when_ready)
+
+    def _read(self):
+        """
+        Read one packet, publish if appropriate, then return.
+        We must not read all packets in a loop here, or we will not actually publish them until the end...
+        """
+        if self._filehandle is None and not self.files:
+            log.msg('Completed reading specified port agent logs, exiting...')
+            reactor.stop()
+            return
+
+        if self._filehandle is None:
+            name = self.files.pop()
+            log.msg('Begin reading:', name)
+            self._filehandle = open(name, 'r')
+
+        packet = Packet.packet_from_fh(self._filehandle)
+        if packet is not None:
+            if packet.packet_type in self.target_types:
+                self.router.got_data(packet)
+
+        else:
+            self._filehandle.close()
+            self._filehandle = None
+
+        # allow the reactor loop to process other events
+        reactor.callLater(0, self._read)
+
+
+#################################################################################
+# Support methods
+#################################################################################
+
 def configure_logging():
-    FORMAT = '%(asctime)-15s %(levelname)s %(message)s'
-    logging.basicConfig(format=FORMAT)
+    log_format = '%(asctime)-15s %(levelname)s %(message)s'
+    logging.basicConfig(format=log_format)
     logger = logging.getLogger('port_agent')
     logger.setLevel(logging.INFO)
     observer = log.PythonLoggingObserver('port_agent')
@@ -635,20 +822,16 @@ def config_from_options(options):
             else:
                 config[name] = options[option]
 
-    if options['tcp']:
-        config['type'] = 'tcp'
-    elif options['rsn']:
-        config['type'] = 'rsn'
-    elif options['botpt']:
-        config['type'] = 'botpt'
-    else:
-        config['type'] = None
+    config['type'] = None
+    for _type in AgentTypes.values():
+        if options[_type]:
+            config['type'] = _type
 
     sniff = options['--sniff']
     if sniff is not None:
         try:
             sniff = int(sniff)
-        except:
+        except (ValueError, TypeError):
             sniff = None
     config['sniffport'] = sniff
 
@@ -666,17 +849,21 @@ def main():
     options = docopt(__doc__)
     config = config_from_options(options)
 
+    agent_type_map = {
+        AgentTypes.TCP: TcpPortAgent,
+        AgentTypes.RSN: RsnPortAgent,
+        AgentTypes.BOTPT: BotptPortAgent,
+        AgentTypes.CAMHD: CamhdPortAgent,
+        AgentTypes.DATALOG: DatalogReadingPortAgent,
+    }
+
     agent_type = config['type']
-    if agent_type == 'tcp':
-        TcpPortAgent(config)
-    elif agent_type == 'rsn':
-        RsnPortAgent(config)
-    elif agent_type == 'botpt':
-        BotptPortAgent(config)
+    agent = agent_type_map.get(agent_type)
+    if agent is not None:
+        agent(config)
+        exit(reactor.run())
     else:
         exit(1)
-
-    reactor.run()
 
 if __name__ == '__main__':
     main()
