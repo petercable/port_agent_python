@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 import struct
-from port_agent import Packet, PacketType
+from agents import Packet, PacketType
 import sys
 
 
