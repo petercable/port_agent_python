@@ -3,8 +3,8 @@ from twisted.internet import reactor
 from agents import PortAgent
 from antelope import Pkt
 from antelope.orb import orbopen, OrbIncompleteException
-from port_agent.common import PacketType
-from port_agent.packet import Packet
+from common import PacketType
+from packet import Packet
 import msgpack
 
 
