@@ -62,7 +62,7 @@ def create_packets(orb_packet):
              'nsamp': channel.data,
              'samprate': channel.samprate,
              'time': channel.time,
-             'type_suffix': orb_packet.suffix,
+             'type_suffix': orb_packet.type.suffix,
              'version': orb_packet.version,
              }
 
