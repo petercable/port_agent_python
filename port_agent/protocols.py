@@ -66,11 +66,12 @@ class DigiInstrumentProtocol(InstrumentProtocol):
         data = ''.join(self.buffer)
         packet, remaining = Packet.packet_from_buffer(data)
         if packet is not None:
-            self.router.got_data([packet])
+            self.port_agent.router.got_data([packet])
             self.buffer.clear()
             self.buffer.extendleft(remaining)
 
-class DigiProtocol(InstrumentProtocol):
+
+class DigiCommandProtocol(InstrumentProtocol):
     """
     Overrides InstrumentProtocol to automatically send the binary timestamp command on connection
     """

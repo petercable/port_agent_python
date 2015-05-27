@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """
 Usage:
-    tcp_simulator.py <port> <rate> <label>
+    rsn_simulator.py <port> <rate> <label>
 """
 import docopt
 import sys
@@ -9,6 +9,8 @@ import sys
 from twisted.internet import protocol, reactor, endpoints
 from twisted.internet.protocol import connectionDone
 from twisted.python import log
+from port_agent.common import PacketType
+from port_agent.packet import Packet
 
 log.startLogging(sys.stdout)
 
@@ -43,12 +45,16 @@ class SampleFactory(protocol.Factory):
 
     def send_sample(self):
         reactor.callLater(self.delay, self.send_sample)
+        packets = Packet.create(self.label + '\n', PacketType.FROM_INSTRUMENT)
         for client in self.clients:
-            client.transport.write(self.label + '\n')
+            for packet in packets:
+                client.transport.write(packet.data)
 
     def echo(self, data):
+        packets = Packet.create('%s - %r\n' % (self.label, data), PacketType.FROM_INSTRUMENT)
         for client in self.clients:
-            client.transport.write('%s - %r\n' % (self.label, data))
+            for packet in packets:
+                client.transport.write(packet.data)
 
 
 def main():

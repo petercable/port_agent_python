@@ -1,5 +1,4 @@
 from twisted.internet import reactor
-from twisted.internet.endpoints import TCP4ClientEndpoint
 from twisted.internet.protocol import ReconnectingClientFactory, Protocol, connectionDone
 
 
@@ -25,11 +24,13 @@ class ClientSimulator(ReconnectingClientFactory):
         print 'clientConnectionLost'
         ReconnectingClientFactory.clientConnectionLost(self, connector, unused_reason)
 
+
 def main():
     addr = 'localhost'
     port = 1234
     reactor.connectTCP(addr, port, ClientSimulator())
     reactor.run()
+
 
 if __name__ == '__main__':
     main()

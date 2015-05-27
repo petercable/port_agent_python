@@ -1,7 +1,8 @@
 from twisted.internet.protocol import ReconnectingClientFactory, Factory
 from twisted.python import log
 from common import MAX_RECONNECT_DELAY
-from protocols import InstrumentProtocol, DigiProtocol, PortAgentProtocol, CommandProtocol, DigiInstrumentProtocol
+from protocols import InstrumentProtocol, PortAgentProtocol, CommandProtocol, DigiInstrumentProtocol, \
+    DigiCommandProtocol
 
 #################################################################################
 # Factories
@@ -34,7 +35,7 @@ class DigiCommandClientFactory(InstrumentClientFactory):
     """
     Overridden to use DigiProtocol to automatically set binary timestamp on connection
     """
-    protocol = DigiProtocol
+    protocol = DigiCommandProtocol
 
 
 class DigiInstrumentClientFactory(InstrumentClientFactory):
@@ -60,6 +61,7 @@ class DataFactory(Factory):
         p = self.protocol(self.port_agent, self.packet_type, self.endpoint_type)
         p.factory = self
         return p
+
 
 class CommandFactory(DataFactory):
     """

@@ -111,4 +111,3 @@ class RouterStat(Enumeration):
     DEL_CLIENT = 2
     PACKET_IN = 3
     PACKET_OUT = 4
-

@@ -130,11 +130,11 @@ class Packet(object):
         # if payload > max_payload break into multiple packets
         # a payload of size max_payload shall be followed by an empty packet
         while len(payload) >= Packet.max_payload:
-            slice = payload[:Packet.max_payload]
+            data_slice = payload[:Packet.max_payload]
             payload = payload[Packet.max_payload:]
-            header = PacketHeader(packet_type=packet_type, payload_size=len(slice), packet_time=now)
-            header.set_checksum(slice)
-            packets.append(Packet(payload=slice, header=header))
+            header = PacketHeader(packet_type=packet_type, payload_size=len(data_slice), packet_time=now)
+            header.set_checksum(data_slice)
+            packets.append(Packet(payload=data_slice, header=header))
 
         header = PacketHeader(packet_type=packet_type, payload_size=len(payload), packet_time=now)
         header.set_checksum(payload)

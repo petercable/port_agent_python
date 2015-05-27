@@ -160,7 +160,6 @@ class BotptPortAgent(PortAgent):
         reactor.connectTCP(self.inst_addr, self.inst_tx_port, tx_factory)
 
 
-
 class DatalogReadingPortAgent(PortAgent):
     def __init__(self, config):
         super(DatalogReadingPortAgent, self).__init__(config)

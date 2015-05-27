@@ -16,7 +16,6 @@ Options:
 
 """
 import logging
-import traceback
 from docopt import docopt
 from twisted.internet import reactor
 from twisted.python import log
@@ -69,31 +68,32 @@ def config_from_options(options):
 
     return config
 
+
 def main():
     configure_logging()
     options = docopt(__doc__)
     config = config_from_options(options)
+
+    try:
+        from camhd_agent import CamhdPortAgent
+    except ImportError:
+        CamhdPortAgent = None
+        log.err('Unable to import CAMHD libraries, CAMHD port agent unavailable')
+
+    try:
+        from antelope_agent import AntelopePortAgent
+    except ImportError:
+        AntelopePortAgent = None
+        log.err('Unable to import Antelope libraries, Antelope port agent unavailable')
 
     agent_type_map = {
         AgentTypes.TCP: TcpPortAgent,
         AgentTypes.RSN: RsnPortAgent,
         AgentTypes.BOTPT: BotptPortAgent,
         AgentTypes.DATALOG: DatalogReadingPortAgent,
+        AgentTypes.CAMHD: CamhdPortAgent,
+        AgentTypes.ANTELOPE: AntelopePortAgent
     }
-
-    try:
-        from camhd import CamhdPortAgent
-        agent_type_map[AgentTypes.CAMHD] = CamhdPortAgent
-    except ImportError as e:
-        traceback.print_exc()
-        log.err('Unable to import CAMHD libraries', e)
-
-    try:
-        from antelope import AntelopePortAgent
-        agent_type_map[AgentTypes.ANTELOPE] = AntelopePortAgent
-    except ImportError as e:
-        traceback.print_exc()
-        log.err('Unable to import Antelope libraries', e)
 
     agent_type = config['type']
     agent = agent_type_map.get(agent_type)

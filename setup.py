@@ -76,7 +76,7 @@ setup(
     # $ pip install -e .[dev,test]
     extras_require={
         'camhd': ['txzmq'],
-        'antelope': ['antelope'],
+        'antelope': ['msgpack-python'],
     },
 
     # If there are data files included in your packages that need to be

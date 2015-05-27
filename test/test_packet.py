@@ -134,7 +134,7 @@ class PacketUnitTest(unittest.TestCase):
         packet_type = PacketType.FROM_INSTRUMENT
         self.assertRaises(InvalidHeaderException, PacketHeader, packet_type=packet_type, payload_size=10)
         self.assertRaises(InvalidHeaderException, PacketHeader,
-                          packet_type=packet_type,payload_size=10, ts_high=4, packet_time=5)
+                          packet_type=packet_type, payload_size=10, ts_high=4, packet_time=5)
 
     def test_bad_crc(self):
         # create a packet
